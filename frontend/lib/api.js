@@ -60,6 +60,13 @@ export const dispensePrescription = (prescriptionId) => api.post(`/prescriptions
 export const createWalkInSale = (data) => api.post("/walkin-sales/", data);
 export const listMedicines = () => api.get("/medicines/");
 
+// ---------------- Shared lists (Doctor & Nurse) ----------------
+
+export const listPatients = (search = "") => api.get(`/patients/?search=${encodeURIComponent(search)}`);
+export const listVisits = (params = "") => api.get(`/visits/${params ? `?${params}` : ""}`);
+export const listWalkInSales = () => api.get("/walkin-sales/");
+export const getDashboardStats = () => api.get("/dashboard/stats/");
+
 // ---------------- Consultation (Doctor) ----------------
 
 export const getQueue = () => api.get("/visits/queue/");

@@ -16,5 +16,6 @@ router.register("payments", views.PaymentViewSet)
 router.register("walkin-sales", views.WalkInSaleViewSet)
 
 urlpatterns = [
+    path("dashboard/stats/", views.DashboardStatsView.as_view(), name="dashboard-stats"),
     path("", include(router.urls)),
 ]
