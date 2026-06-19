@@ -1,14 +1,18 @@
 from django.utils import timezone
+from django.db.models import Sum, Count
+from django.db.models.functions import TruncDate
+from datetime import timedelta
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
     ConsultationType, ICD10Code, DiagnosisNote, Medicine,
     Patient, Visit, Triage, Consultation, Prescription,
-    Payment, WalkInSale,
+    Payment, WalkInSale, WalkInSaleItem,
 )
 from .serializers import (
     ConsultationTypeSerializer, ICD10CodeSerializer, DiagnosisNoteSerializer,
@@ -16,7 +20,7 @@ from .serializers import (
     ConsultationSerializer, CompleteConsultationSerializer, PrescriptionSerializer,
     PaymentSerializer, WalkInSaleSerializer,
 )
-from .permissions import IsNurse, IsDoctor, IsAdminOrReadOnly
+from .permissions import IsNurse, IsDoctor, IsAdminOrReadOnly, IsNurseOrReadOnly
 
 
 # ---------------- Lookup tables (admin manages, everyone reads) ----------------
@@ -54,15 +58,15 @@ class MedicineViewSet(viewsets.ModelViewSet):
 # ---------------- Patient / Reception (Nurse) ----------------
 
 class PatientViewSet(viewsets.ModelViewSet):
-    queryset = Patient.objects.all()
+    queryset = Patient.objects.all().order_by("-created_at")
     serializer_class = PatientSerializer
-    permission_classes = [IsNurse]
+    permission_classes = [IsNurseOrReadOnly]
     filter_backends = [filters.SearchFilter]
     search_fields = ["first_name", "last_name", "phone", "national_id"]
 
 
 class VisitViewSet(viewsets.ModelViewSet):
-    queryset = Visit.objects.select_related("patient", "consultation_type", "triage").all()
+    queryset = Visit.objects.select_related("patient", "consultation_type", "triage").order_by("-created_at")
     serializer_class = VisitSerializer
     permission_classes = [IsAuthenticated]  # nurse creates, doctor reads queue
     filter_backends = [DjangoFilterBackend]
@@ -162,6 +166,66 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
 
 class WalkInSaleViewSet(viewsets.ModelViewSet):
-    queryset = WalkInSale.objects.prefetch_related("items", "items__medicine").all()
+    queryset = WalkInSale.objects.prefetch_related("items", "items__medicine").order_by("-created_at")
     serializer_class = WalkInSaleSerializer
-    permission_classes = [IsNurse]
+    permission_classes = [IsNurseOrReadOnly]
+
+
+# ---------------- Dashboard (shared by Doctor & Nurse, graphs) ----------------
+
+class DashboardStatsView(APIView):
+    """Aggregated stats for dashboard graphs. Available to any authenticated
+    staff member (doctor/nurse/admin) — both roles see the same hospital-wide
+    picture, just from different sidebars."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        today = timezone.now().date()
+        thirty_days_ago = today - timedelta(days=29)
+
+        # Visits per day (last 30 days)
+        visits_by_day = (
+            Visit.objects.filter(created_at__date__gte=thirty_days_ago)
+            .annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(count=Count("id"))
+            .order_by("day")
+        )
+
+        # Revenue per day (last 30 days) - consultations + OTC sales
+        revenue_by_day = (
+            Payment.objects.filter(paid_at__date__gte=thirty_days_ago)
+            .annotate(day=TruncDate("paid_at"))
+            .values("day")
+            .annotate(total=Sum("amount"))
+            .order_by("day")
+        )
+
+        # Top 5 most-prescribed/dispensed medicines (last 30 days, consultations + OTC)
+        top_prescribed = (
+            Prescription.objects.filter(consultation__started_at__date__gte=thirty_days_ago)
+            .values("medicine__name")
+            .annotate(quantity=Sum("quantity"))
+            .order_by("-quantity")[:5]
+        )
+
+        # Visits by consultation type (all-time, for a breakdown chart)
+        visits_by_type = (
+            Visit.objects.values("consultation_type__name")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
+
+        return Response({
+            "total_patients": Patient.objects.count(),
+            "total_visits": Visit.objects.count(),
+            "visits_today": Visit.objects.filter(created_at__date=today).count(),
+            "total_revenue": Payment.objects.aggregate(total=Sum("amount"))["total"] or 0,
+            "revenue_today": Payment.objects.filter(paid_at__date=today).aggregate(total=Sum("amount"))["total"] or 0,
+            "queue_length": Visit.objects.filter(status=Visit.Status.QUEUED).count(),
+            "low_stock_medicines": Medicine.objects.filter(stock_quantity__lt=20).count(),
+            "visits_by_day": [{"date": str(r["day"]), "count": r["count"]} for r in visits_by_day],
+            "revenue_by_day": [{"date": str(r["day"]), "amount": float(r["total"])} for r in revenue_by_day],
+            "top_medicines": [{"name": r["medicine__name"], "quantity": r["quantity"]} for r in top_prescribed],
+            "visits_by_type": [{"name": r["consultation_type__name"], "count": r["count"]} for r in visits_by_type],
+        })
